@@ -1276,18 +1276,100 @@ app.post('/admin/draws/:drawId/execute', async (req, res) => {
   try {
     const { drawId } = req.params;
     
-    // First calculate winners
-    const calculateResponse = await fetch(`http://localhost:${PORT}/admin/draws/${drawId}/calculate-winners`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    });
-    
-    if (!calculateResponse.ok) {
-      return res.status(500).json({ error: 'Failed to calculate winners' });
+    // Get the draw
+    const { data: draw, error: drawError } = await supabaseAdmin
+      .from('draws')
+      .select('*')
+      .eq('id', drawId)
+      .single();
+
+    if (drawError || !draw) {
+      return res.status(404).json({ error: 'Draw not found' });
     }
-    
-    const calculateResult = await calculateResponse.json();
-    const winners = calculateResult.winners;
+
+    // Get all tickets from last 7 days
+    const { data: tickets, error: ticketsError } = await supabaseAdmin
+      .from('tickets')
+      .select('*')
+      .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+
+    if (ticketsError) {
+      console.error('Get tickets error:', ticketsError);
+      return res.status(500).json({ error: 'Failed to get tickets' });
+    }
+
+    // Calculate winners
+    const winners = [];
+    const winningNumbers = draw.winning_numbers;
+    const winningPowerball = draw.powerball;
+
+    for (const ticket of tickets) {
+      const matchingNumbers = ticket.numbers.filter(num => winningNumbers.includes(num)).length;
+      const powerballMatch = ticket.powerball === winningPowerball;
+
+      let prizeTier = 0;
+      if (matchingNumbers === 5 && powerballMatch) prizeTier = 1;
+      else if (matchingNumbers === 5) prizeTier = 2;
+      else if (matchingNumbers === 4 && powerballMatch) prizeTier = 3;
+      else if (matchingNumbers === 4) prizeTier = 4;
+      else if (matchingNumbers === 3 && powerballMatch) prizeTier = 5;
+      else if (matchingNumbers === 3) prizeTier = 6;
+
+      if (prizeTier > 0) {
+        winners.push({
+          ticket_id: ticket.id,
+          user_id: ticket.user_id,
+          prize_tier: prizeTier,
+          matching_numbers: matchingNumbers,
+          powerball_match: powerballMatch
+        });
+      }
+    }
+
+    // Get current pot
+    const { data: pot } = await supabaseAdmin
+      .from('pot')
+      .select('current_amount')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const totalPot = pot ? parseFloat(pot.current_amount) : 0;
+
+    // Calculate prizes with cascading distribution
+    const winnerPot = totalPot * 0.85;
+    const tierAllocations = {
+      1: 1.0, 2: 0.5, 3: 0.25, 4: 0.10, 5: 0.05, 6: 0.02
+    };
+
+    const winnerCountByTier = {};
+    winners.forEach(w => {
+      winnerCountByTier[w.prize_tier] = (winnerCountByTier[w.prize_tier] || 0) + 1;
+    });
+
+    let remainingPot = winnerPot;
+    const prizePerWinnerByTier = {};
+
+    for (let tier = 1; tier <= 6; tier++) {
+      const winnersInTier = winnerCountByTier[tier] || 0;
+      if (winnersInTier > 0 && remainingPot > 0) {
+        const tierAllocation = winnerPot * tierAllocations[tier];
+        const tierTotalPrize = Math.min(tierAllocation, remainingPot);
+        prizePerWinnerByTier[tier] = tierTotalPrize / winnersInTier;
+        remainingPot -= tierTotalPrize;
+      }
+    }
+
+    const finalWinners = winners.map(winner => ({
+      ...winner,
+      prize_amount: prizePerWinnerByTier[winner.prize_tier] || 0
+    }));
+
+    const calculateResult = {
+      draw,
+      winners: finalWinners,
+      total_pot: totalPot
+    };
     
     if (winners.length === 0) {
       return res.json({
