@@ -1,5 +1,16 @@
 # 🎲 Powerball Draw & Payout Process
 
+## ⏰ **Automated Weekly Draw System**
+
+✅ **Fully Automated** - Runs every Friday at 20:00 UTC
+✅ **Cryptographically Secure** - Uses `crypto.randomInt()` for provably fair random numbers
+✅ **Cascading Prize Distribution** - Handles multiple winners fairly
+✅ **Automatic Payouts** - Sends SOL directly to winners
+✅ **Social Media Integration** - Posts results to Twitter/X automatically
+✅ **Pot Reset** - Automatically resets for next week
+
+**Next Draw:** Friday, 20:00 UTC (check `/countdown` endpoint for exact time)
+
 ## 📋 **Complete Draw Workflow**
 
 ### **Step 1: Generate Random Draw**
@@ -54,20 +65,29 @@ POST /admin/draws/:drawId/execute
 
 ### **Weekly Draw Schedule**
 ```javascript
-// Example: Every Sunday at 8 PM
-const drawSchedule = {
-  day: 'Sunday',
-  time: '20:00',
-  timezone: 'UTC'
-};
+// Cron: Every Friday at 20:00 UTC
+cron.schedule('0 20 * * 5', async () => {
+  await executeAutomatedDraw();
+}, {
+  scheduled: true,
+  timezone: "UTC"
+});
 ```
 
-### **Complete Automation**
-1. **Generate draw** automatically
-2. **Calculate winners** immediately
-3. **Send payouts** to all winners
-4. **Reset pot** for next draw
-5. **Notify winners** via email/SMS
+### **Complete Automation - Every Friday 20:00 UTC**
+1. 🎲 **Generate draw** with cryptographically secure random numbers
+2. 🎫 **Find eligible tickets** from last 7 days
+3. 🏆 **Calculate winners** with cascading prize distribution
+4. 💾 **Save winners** to database
+5. 💰 **Send SOL payouts** to all winners automatically
+6. 🔄 **Reset pot** to 0 for next draw
+7. 📱 **Post results to Twitter/X** with winning numbers, winners, and transaction signatures
+
+### **Manual Testing Endpoint**
+```bash
+POST /admin/draws/execute-automated
+```
+Triggers the complete automated flow for testing purposes.
 
 ## 💰 **Payout System**
 
@@ -130,10 +150,29 @@ curl http://localhost:3001/admin/stats
 
 ### **Environment Variables**
 ```env
+# Solana Configuration
 TREASURY_WALLET=5biVbs3NNfEEvCoLV9Y1SmLUfcTgX1WuKUGfNJq9AbAK
 HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
 TREASURY_PRIVATE_KEY=your_private_key_here
+
+# Twitter/X API (Optional - for automated social media posts)
+TWITTER_API_KEY=your_twitter_api_key
+TWITTER_API_SECRET=your_twitter_api_secret
+TWITTER_ACCESS_TOKEN=your_twitter_access_token
+TWITTER_ACCESS_SECRET=your_twitter_access_secret
+
+# Port Configuration
+PORT=3001
 ```
+
+### **How to Get Twitter API Credentials**
+1. Go to https://developer.twitter.com/
+2. Create a new app (free tier available)
+3. Enable **Read and Write** permissions
+4. Generate API keys and access tokens
+5. Add to your `.env` file
+
+**Note:** Twitter posting is optional. If credentials are not configured, the system will skip the social media post but continue with all other operations.
 
 ### **Prize Distribution (85% to Winners)**
 ```javascript

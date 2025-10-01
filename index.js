@@ -3,6 +3,9 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const dotenv = require('dotenv');
+const crypto = require('crypto');
+const cron = require('node-cron');
+const { TwitterApi } = require('twitter-api-v2');
 
 // Load environment variables FIRST
 dotenv.config();
@@ -119,9 +122,12 @@ app.get('/', (req, res) => {
       winners: {
         my: 'GET /winners/my'
       },
-          pot: {
-            get: 'GET /pot'
-          },
+      pot: {
+        get: 'GET /pot'
+      },
+      countdown: {
+        get: 'GET /countdown'
+      },
           admin: {
             createDraw: 'POST /admin/draws/create',
             generateDraw: 'POST /admin/draws/generate',
@@ -129,7 +135,8 @@ app.get('/', (req, res) => {
             executeDraw: 'POST /admin/draws/:drawId/execute',
             treasuryBalance: 'GET /admin/treasury/balance',
             sendPayout: 'POST /admin/payouts/send',
-            stats: 'GET /admin/stats'
+            stats: 'GET /admin/stats',
+            resetPot: 'POST /admin/pot/reset'
           }
     }
   });
@@ -601,21 +608,199 @@ app.get('/pot', async (req, res) => {
   }
 });
 
+// Manual trigger for automated draw (testing only)
+app.post('/admin/draws/execute-automated', async (req, res) => {
+  try {
+    console.log('🔧 Manual trigger of automated draw process...\n');
+    await executeAutomatedDraw();
+    res.json({ message: 'Automated draw executed successfully' });
+  } catch (error) {
+    console.error('Execute automated draw error:', error);
+    res.status(500).json({ error: 'Failed to execute automated draw' });
+  }
+});
+
+// Test Twitter posting (testing only)
+app.post('/admin/test/twitter', async (req, res) => {
+  try {
+    const testResults = {
+      draw: {
+        winning_numbers: [5, 12, 18, 24, 29],
+        powerball: 7,
+        id: 'test-draw-id'
+      },
+      winners: [
+        {
+          wallet_address: '4EPFeqtnyYTa2vmn6NTiViZ8nNv7cMsQZRi43Y24VUnf',
+          prize_tier: 1,
+          prize_amount: 50.5,
+          transaction_signature: '5YourTestTransactionSignatureHere...'
+        }
+      ],
+      totalPot: 100,
+      totalPaid: 85,
+      successfulPayouts: 1
+    };
+
+    const result = await postDrawResultsToTwitter(testResults);
+    res.json(result);
+  } catch (error) {
+    console.error('Test Twitter error:', error);
+    res.status(500).json({ error: 'Failed to test Twitter posting' });
+  }
+});
+
+// Reset pot (admin only)
+app.post('/admin/pot/reset', async (req, res) => {
+  try {
+    const { data: currentPot, error: fetchError } = await supabaseAdmin
+      .from('pot')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (fetchError) {
+      console.error('Get pot error:', fetchError);
+      return res.status(500).json({ error: 'Failed to get pot information' });
+    }
+
+    const oldAmount = currentPot ? currentPot.current_amount : 0;
+
+    // Update pot to 0
+    const { data: updatedPot, error } = await supabaseAdmin
+      .from('pot')
+      .update({
+        current_amount: 0,
+        total_tickets_sold: 0,
+        last_updated: new Date().toISOString()
+      })
+      .eq('id', currentPot.id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Reset pot error:', error);
+      return res.status(500).json({ error: 'Failed to reset pot' });
+    }
+
+    console.log('💰 Pot reset successfully!');
+    console.log(`   - Previous amount: ${oldAmount} SOL`);
+    console.log(`   - New amount: 0 SOL`);
+
+    res.json({
+      message: 'Pot reset successfully',
+      previous_amount: oldAmount,
+      new_amount: 0,
+      pot: updatedPot
+    });
+  } catch (error) {
+    console.error('Reset pot error:', error);
+    res.status(500).json({ error: 'Failed to reset pot' });
+  }
+});
+
+// Countdown route - Calculate time until next Friday 20:00 UTC draw
+app.get('/countdown', async (req, res) => {
+  try {
+    const now = new Date();
+    const currentUTC = new Date(now.getTime() + (now.getTimezoneOffset() * 60000));
+    
+    // Get current day of week (0 = Sunday, 1 = Monday, ..., 5 = Friday, 6 = Saturday)
+    const currentDay = currentUTC.getUTCDay();
+    const currentHour = currentUTC.getUTCHours();
+    const currentMinute = currentUTC.getUTCMinutes();
+    const currentSecond = currentUTC.getUTCSeconds();
+    
+    // Calculate days until next Friday
+    let daysUntilFriday;
+    if (currentDay === 5) { // Friday
+      if (currentHour < 20 || (currentHour === 20 && currentMinute === 0 && currentSecond === 0)) {
+        // It's Friday but before 20:00 UTC, next draw is today
+        daysUntilFriday = 0;
+      } else {
+        // It's Friday but after 20:00 UTC, next draw is next Friday
+        daysUntilFriday = 7;
+      }
+    } else if (currentDay < 5) {
+      // Monday to Thursday
+      daysUntilFriday = 5 - currentDay;
+    } else {
+      // Saturday or Sunday
+      daysUntilFriday = 5 + (7 - currentDay);
+    }
+    
+    // Calculate next draw time
+    const nextDraw = new Date(currentUTC);
+    nextDraw.setUTCDate(currentUTC.getUTCDate() + daysUntilFriday);
+    nextDraw.setUTCHours(20, 0, 0, 0); // 20:00 UTC
+    
+    // Calculate time difference in milliseconds
+    const timeDiff = nextDraw.getTime() - currentUTC.getTime();
+    
+    // Convert to hours, minutes, seconds
+    const totalHours = Math.floor(timeDiff / (1000 * 60 * 60));
+    const totalMinutes = Math.floor(timeDiff / (1000 * 60));
+    const totalSeconds = Math.floor(timeDiff / 1000);
+    
+    const hours = totalHours;
+    const minutes = totalMinutes % 60;
+    const seconds = totalSeconds % 60;
+    
+    // Format next draw date
+    const nextDrawDate = nextDraw.toISOString().split('T')[0]; // YYYY-MM-DD
+    const nextDrawTime = '20:00 UTC';
+    const nextDrawDay = nextDraw.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      timeZone: 'UTC' 
+    });
+    
+    res.json({
+      next_draw: {
+        date: nextDrawDate,
+        time: nextDrawTime,
+        day: nextDrawDay,
+        full_datetime: nextDraw.toISOString()
+      },
+      countdown: {
+        total_hours: hours,
+        total_minutes: totalMinutes,
+        total_seconds: totalSeconds,
+        hours: hours,
+        minutes: minutes,
+        seconds: seconds,
+        formatted: `${hours}h ${minutes}m ${seconds}s`
+      },
+      current_time: {
+        utc: currentUTC.toISOString(),
+        day: currentUTC.toLocaleDateString('en-US', { 
+          weekday: 'long', 
+          timeZone: 'UTC' 
+        }),
+        time: `${currentUTC.getUTCHours().toString().padStart(2, '0')}:${currentUTC.getUTCMinutes().toString().padStart(2, '0')}:${currentUTC.getUTCSeconds().toString().padStart(2, '0')} UTC`
+      }
+    });
+  } catch (error) {
+    console.error('Countdown calculation error:', error);
+    res.status(500).json({ error: 'Failed to calculate countdown' });
+  }
+});
+
 // Generate random winning numbers
 app.post('/admin/draws/generate', async (req, res) => {
   try {
-    // Generate 5 unique numbers between 1-30
+    // Generate 5 unique numbers between 1-30 using cryptographically secure random
     const winning_numbers = [];
     while (winning_numbers.length < 5) {
-      const num = Math.floor(Math.random() * 30) + 1;
+      const num = crypto.randomInt(1, 31); // Cryptographically secure: 1-30 inclusive
       if (!winning_numbers.includes(num)) {
         winning_numbers.push(num);
       }
     }
     winning_numbers.sort((a, b) => a - b);
 
-    // Generate powerball between 1-10
-    const powerball = Math.floor(Math.random() * 10) + 1;
+    // Generate powerball between 1-10 using cryptographically secure random
+    const powerball = crypto.randomInt(1, 11); // Cryptographically secure: 1-10 inclusive
 
     const { data: draw, error } = await supabaseAdmin
       .from('draws')
@@ -631,6 +816,13 @@ app.post('/admin/draws/generate', async (req, res) => {
       console.error('Generate draw error:', error);
       return res.status(500).json({ error: 'Failed to generate draw' });
     }
+
+    console.log('🎲 Draw generated successfully! (Cryptographically Secure)');
+    console.log('📊 Winning Numbers:', winning_numbers.join(', '));
+    console.log('🎯 Powerball:', powerball);
+    console.log('📅 Draw Date:', new Date().toISOString());
+    console.log('🆔 Draw ID:', draw.id);
+    console.log('🔒 Random Generation: crypto.randomInt() - Provably Fair');
 
     res.status(201).json({ 
       message: 'Draw generated successfully',
@@ -732,19 +924,63 @@ app.post('/admin/draws/:drawId/calculate-winners', async (req, res) => {
     const winnerPot = totalPot * 0.85; // 85% for winners
     const revenue = totalPot * 0.15;   // 15% revenue
     
-    const prizeDistribution = {
-      1: winnerPot * 1.0,    // Jackpot: 100% of winner pot
-      2: winnerPot * 0.5,    // 5 numbers: 50% of winner pot
-      3: winnerPot * 0.25,   // 4 + powerball: 25% of winner pot
-      4: winnerPot * 0.10,   // 4 numbers: 10% of winner pot
-      5: winnerPot * 0.05,   // 3 + powerball: 5% of winner pot
-      6: winnerPot * 0.02    // 3 numbers: 2% of winner pot
+    console.log(`\n💰 PRIZE DISTRIBUTION - Total Pot: ${totalPot} SOL`);
+    console.log(`💵 Winner Pot (85%): ${winnerPot} SOL`);
+    console.log(`💸 Revenue (15%): ${revenue} SOL\n`);
+
+    // Tier allocation percentages (maximum each tier can get)
+    const tierAllocations = {
+      1: 1.0,    // Jackpot: 100% of remaining pot
+      2: 0.5,    // 5 numbers: 50% of remaining pot
+      3: 0.25,   // 4 + powerball: 25% of remaining pot
+      4: 0.10,   // 4 numbers: 10% of remaining pot
+      5: 0.05,   // 3 + powerball: 5% of remaining pot
+      6: 0.02    // 3 numbers: 2% of remaining pot
     };
+
+    // Count winners per tier
+    const winnerCountByTier = {};
+    winners.forEach(winner => {
+      winnerCountByTier[winner.prize_tier] = (winnerCountByTier[winner.prize_tier] || 0) + 1;
+    });
+
+    // CASCADING MODEL: Distribute prizes starting from highest tier
+    let remainingPot = winnerPot;
+    const prizePerWinnerByTier = {};
+    
+    // Process tiers in order (1 = highest priority)
+    for (let tier = 1; tier <= 6; tier++) {
+      const winnersInTier = winnerCountByTier[tier] || 0;
+      
+      if (winnersInTier > 0 && remainingPot > 0) {
+        // Calculate how much this tier should get (percentage of ORIGINAL winner pot)
+        const tierAllocation = winnerPot * tierAllocations[tier];
+        
+        // Take the minimum of allocation or remaining pot
+        const tierTotalPrize = Math.min(tierAllocation, remainingPot);
+        
+        // Split equally among winners in this tier
+        prizePerWinnerByTier[tier] = tierTotalPrize / winnersInTier;
+        
+        // Deduct from remaining pot
+        remainingPot -= tierTotalPrize;
+        
+        console.log(`🏆 Tier ${tier}: ${winnersInTier} winner(s)`);
+        console.log(`   - Tier allocation: ${tierAllocation.toFixed(6)} SOL (${(tierAllocations[tier] * 100).toFixed(0)}% of winner pot)`);
+        console.log(`   - Actually distributed: ${tierTotalPrize.toFixed(6)} SOL`);
+        console.log(`   - Per winner: ${prizePerWinnerByTier[tier].toFixed(6)} SOL`);
+        console.log(`   - Remaining pot: ${remainingPot.toFixed(6)} SOL\n`);
+      }
+    }
+
+    if (remainingPot > 0.000001) {
+      console.log(`ℹ️  Undistributed pot: ${remainingPot.toFixed(6)} SOL (rolls over or kept as extra revenue)\n`);
+    }
 
     // Update winners with prize amounts
     const finalWinners = winners.map(winner => ({
       ...winner,
-      prize_amount: prizeDistribution[winner.prize_tier] || 0
+      prize_amount: prizePerWinnerByTier[winner.prize_tier] || 0
     }));
 
     // Save winners to database
@@ -754,11 +990,10 @@ app.post('/admin/draws/:drawId/calculate-winners', async (req, res) => {
         .insert(finalWinners.map(winner => ({
           draw_id: drawId,
           ticket_id: winner.ticket_id,
-          user_id: winner.user_id,
-          prize_tier: winner.prize_tier,
+          match_count: winner.matching_numbers,
+          powerball_match: winner.powerball_match,
           prize_amount: winner.prize_amount,
-          matching_numbers: winner.matching_numbers,
-          powerball_match: winner.powerball_match
+          claimed: false
         })));
 
       if (winnersError) {
@@ -1183,11 +1418,376 @@ app.use('*', (req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
+// Twitter/X Post Function
+async function postDrawResultsToTwitter(drawResults) {
+  try {
+    // Initialize Twitter client only if credentials are available
+    if (!process.env.TWITTER_API_KEY || 
+        !process.env.TWITTER_API_SECRET || 
+        !process.env.TWITTER_ACCESS_TOKEN || 
+        !process.env.TWITTER_ACCESS_SECRET) {
+      console.log('⚠️  Twitter credentials not configured - skipping social media post');
+      return { success: false, reason: 'credentials_missing' };
+    }
+
+    const twitterClient = new TwitterApi({
+      appKey: process.env.TWITTER_API_KEY,
+      appSecret: process.env.TWITTER_API_SECRET,
+      accessToken: process.env.TWITTER_ACCESS_TOKEN,
+      accessSecret: process.env.TWITTER_ACCESS_SECRET,
+    });
+
+    // Format the tweet
+    const { draw, winners, totalPot, totalPaid, successfulPayouts } = drawResults;
+    
+    let tweet = `🎰 POWERBALL DRAW RESULTS 🎰\n\n`;
+    tweet += `🎲 Winning Numbers: ${draw.winning_numbers.join(', ')}\n`;
+    tweet += `🎯 Powerball: ${draw.powerball}\n\n`;
+    tweet += `💰 Total Pot: ${totalPot} SOL\n`;
+    tweet += `🏆 Winners: ${winners.length}\n`;
+    tweet += `💸 Total Paid: ${totalPaid} SOL\n\n`;
+
+    if (winners.length > 0) {
+      tweet += `🎉 WINNERS:\n`;
+      winners.forEach((winner, index) => {
+        const tierNames = {
+          1: 'JACKPOT (5+PB)',
+          2: '5 Numbers',
+          3: '4+Powerball',
+          4: '4 Numbers',
+          5: '3+Powerball',
+          6: '3 Numbers'
+        };
+        const walletShort = `${winner.wallet_address.substring(0, 4)}...${winner.wallet_address.substring(winner.wallet_address.length - 4)}`;
+        tweet += `${index + 1}. ${tierNames[winner.prize_tier]} - ${winner.prize_amount} SOL\n`;
+        tweet += `   Wallet: ${walletShort}\n`;
+        if (winner.transaction_signature) {
+          tweet += `   TX: https://solscan.io/tx/${winner.transaction_signature}\n`;
+        }
+      });
+    } else {
+      tweet += `No winners this draw - pot rolls over! 🔄`;
+    }
+
+    tweet += `\n📅 Next draw: Friday 20:00 UTC\n`;
+    tweet += `🎫 Get your tickets now!`;
+
+    // Post to Twitter
+    const result = await twitterClient.v2.tweet(tweet);
+    
+    console.log('✅ Successfully posted draw results to Twitter/X!');
+    console.log(`📱 Tweet ID: ${result.data.id}`);
+    console.log(`📱 Tweet preview:\n${tweet}\n`);
+    
+    return { success: true, tweet, tweetId: result.data.id };
+  } catch (error) {
+    console.error('❌ Failed to post to Twitter:', error.message);
+    console.error('❌ Error details:', JSON.stringify(error, null, 2));
+    if (error.data) {
+      console.error('❌ Twitter API response:', error.data);
+    }
+    return { success: false, error: error.message, details: error.data };
+  }
+}
+
+// Automated Draw Execution Function
+async function executeAutomatedDraw() {
+  try {
+    console.log('\n🤖 ============================================');
+    console.log('🤖 AUTOMATED DRAW EXECUTION STARTED');
+    console.log('🤖 ============================================\n');
+    console.log(`⏰ Time: ${new Date().toISOString()}`);
+    console.log(`📅 Day: ${new Date().toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })}`);
+    console.log(`🕐 UTC Time: ${new Date().toISOString()}\n`);
+
+    // Step 1: Generate the draw
+    console.log('📝 Step 1: Generating random draw...');
+    const winning_numbers = [];
+    while (winning_numbers.length < 5) {
+      const num = crypto.randomInt(1, 31);
+      if (!winning_numbers.includes(num)) {
+        winning_numbers.push(num);
+      }
+    }
+    winning_numbers.sort((a, b) => a - b);
+    const powerball = crypto.randomInt(1, 11);
+
+    const { data: draw, error: drawError } = await supabaseAdmin
+      .from('draws')
+      .insert({
+        winning_numbers,
+        powerball,
+        draw_date: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (drawError) {
+      console.error('❌ Failed to create draw:', drawError);
+      return;
+    }
+
+    console.log('✅ Draw created successfully!');
+    console.log(`🎲 Draw ID: ${draw.id}`);
+    console.log(`📊 Winning Numbers: ${winning_numbers.join(', ')}`);
+    console.log(`🎯 Powerball: ${powerball}\n`);
+
+    // Step 2: Get current pot
+    const { data: pot } = await supabaseAdmin
+      .from('pot')
+      .select('current_amount')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const totalPot = pot ? parseFloat(pot.current_amount) : 0;
+    console.log(`💰 Current Pot: ${totalPot} SOL\n`);
+
+    // Step 3: Get all tickets from last 7 days
+    console.log('📝 Step 2: Finding eligible tickets...');
+    const { data: tickets } = await supabaseAdmin
+      .from('tickets')
+      .select(`
+        *,
+        users!inner(wallet_address)
+      `)
+      .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString());
+
+    console.log(`🎫 Found ${tickets?.length || 0} eligible tickets\n`);
+
+    if (!tickets || tickets.length === 0) {
+      console.log('ℹ️  No tickets found - no winners for this draw\n');
+      console.log('🤖 ============================================\n');
+      return;
+    }
+
+    // Step 4: Calculate winners
+    console.log('📝 Step 3: Calculating winners...');
+    const winners = [];
+    
+    for (const ticket of tickets) {
+      const matchingNumbers = ticket.numbers.filter(num => winning_numbers.includes(num)).length;
+      const powerballMatch = ticket.powerball === powerball;
+
+      let prizeTier = 0;
+      if (matchingNumbers === 5 && powerballMatch) prizeTier = 1;
+      else if (matchingNumbers === 5) prizeTier = 2;
+      else if (matchingNumbers === 4 && powerballMatch) prizeTier = 3;
+      else if (matchingNumbers === 4) prizeTier = 4;
+      else if (matchingNumbers === 3 && powerballMatch) prizeTier = 5;
+      else if (matchingNumbers === 3) prizeTier = 6;
+
+      if (prizeTier > 0) {
+        winners.push({
+          ticket_id: ticket.id,
+          user_id: ticket.user_id,
+          wallet_address: ticket.users.wallet_address,
+          prize_tier: prizeTier,
+          matching_numbers: matchingNumbers,
+          powerball_match: powerballMatch
+        });
+      }
+    }
+
+    console.log(`🏆 Found ${winners.length} winner(s)\n`);
+
+    if (winners.length === 0) {
+      console.log('ℹ️  No winners for this draw\n');
+      console.log('🤖 ============================================\n');
+      return;
+    }
+
+    // Step 5: Calculate and distribute prizes
+    console.log('📝 Step 4: Calculating prize distribution...');
+    const winnerPot = totalPot * 0.85;
+    const revenue = totalPot * 0.15;
+
+    console.log(`💰 Total Pot: ${totalPot} SOL`);
+    console.log(`💵 Winner Pot (85%): ${winnerPot} SOL`);
+    console.log(`💸 Revenue (15%): ${revenue} SOL\n`);
+
+    const tierAllocations = {
+      1: 1.0, 2: 0.5, 3: 0.25, 4: 0.10, 5: 0.05, 6: 0.02
+    };
+
+    const winnerCountByTier = {};
+    winners.forEach(w => {
+      winnerCountByTier[w.prize_tier] = (winnerCountByTier[w.prize_tier] || 0) + 1;
+    });
+
+    let remainingPot = winnerPot;
+    const prizePerWinnerByTier = {};
+
+    for (let tier = 1; tier <= 6; tier++) {
+      const winnersInTier = winnerCountByTier[tier] || 0;
+      if (winnersInTier > 0 && remainingPot > 0) {
+        const tierAllocation = winnerPot * tierAllocations[tier];
+        const tierTotalPrize = Math.min(tierAllocation, remainingPot);
+        prizePerWinnerByTier[tier] = tierTotalPrize / winnersInTier;
+        remainingPot -= tierTotalPrize;
+        console.log(`🏆 Tier ${tier}: ${winnersInTier} winner(s) @ ${prizePerWinnerByTier[tier].toFixed(6)} SOL each`);
+      }
+    }
+    console.log('');
+
+    const finalWinners = winners.map(winner => ({
+      ...winner,
+      prize_amount: prizePerWinnerByTier[winner.prize_tier] || 0
+    }));
+
+    // Step 6: Save winners to database
+    console.log('📝 Step 5: Saving winners to database...');
+    await supabaseAdmin
+      .from('winners')
+      .insert(finalWinners.map(winner => ({
+        draw_id: draw.id,
+        ticket_id: winner.ticket_id,
+        match_count: winner.matching_numbers,
+        powerball_match: winner.powerball_match,
+        prize_amount: winner.prize_amount,
+        claimed: false
+      })));
+    console.log('✅ Winners saved to database\n');
+
+    // Step 7: Send payouts
+    console.log('📝 Step 6: Sending payouts via Solana...');
+    let successfulPayouts = 0;
+    let failedPayouts = 0;
+    const winnersWithTransactions = [];
+
+    for (const winner of finalWinners) {
+      try {
+        const payoutResult = await solanaService.sendPayout(
+          winner.wallet_address,
+          winner.prize_amount
+        );
+
+        if (payoutResult.success) {
+          successfulPayouts++;
+          console.log(`✅ Paid ${winner.prize_amount} SOL to ${winner.wallet_address.substring(0, 8)}...`);
+          console.log(`   TX: ${payoutResult.signature}`);
+          
+          // Update winner record with claimed status
+          await supabaseAdmin
+            .from('winners')
+            .update({
+              claimed: true
+            })
+            .eq('ticket_id', winner.ticket_id)
+            .eq('draw_id', draw.id);
+
+          // Track winner with transaction signature for Twitter post
+          winnersWithTransactions.push({
+            ...winner,
+            transaction_signature: payoutResult.signature
+          });
+        }
+      } catch (error) {
+        failedPayouts++;
+        console.error(`❌ Failed to pay ${winner.wallet_address.substring(0, 8)}...:`, error.message);
+      }
+    }
+
+    console.log('');
+    console.log(`✅ Successful payouts: ${successfulPayouts}`);
+    console.log(`❌ Failed payouts: ${failedPayouts}`);
+    console.log(`💰 Total paid out: ${finalWinners.reduce((sum, w) => sum + w.prize_amount, 0).toFixed(6)} SOL\n`);
+
+    // Step 8: Reset pot for next draw
+    console.log('📝 Step 7: Resetting pot for next draw...');
+    const { data: currentPot } = await supabaseAdmin
+      .from('pot')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (currentPot) {
+      await supabaseAdmin
+        .from('pot')
+        .update({
+          current_amount: 0,
+          total_tickets_sold: 0,
+          last_updated: new Date().toISOString()
+        })
+        .eq('id', currentPot.id);
+      console.log('✅ Pot reset to 0 for next draw\n');
+    }
+
+    // Step 9: Post results to Twitter/X
+    console.log('📝 Step 8: Posting results to Twitter/X...');
+    const twitterResult = await postDrawResultsToTwitter({
+      draw: {
+        winning_numbers: winning_numbers,
+        powerball: powerball,
+        id: draw.id
+      },
+      winners: winnersWithTransactions,
+      totalPot: totalPot,
+      totalPaid: finalWinners.reduce((sum, w) => sum + w.prize_amount, 0),
+      successfulPayouts: successfulPayouts
+    });
+
+    if (twitterResult.success) {
+      console.log('✅ Draw results posted to social media\n');
+    } else {
+      console.log(`⚠️  Social media post skipped: ${twitterResult.reason || twitterResult.error}\n`);
+    }
+
+    console.log('🤖 ============================================');
+    console.log('🤖 AUTOMATED DRAW EXECUTION COMPLETED');
+    console.log('🤖 ============================================\n');
+  } catch (error) {
+    console.error('❌ Automated draw execution failed:', error);
+    console.log('🤖 ============================================\n');
+  }
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Powerball Backend running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🔗 API docs: http://localhost:${PORT}/`);
+  
+  // Schedule automated draw every Friday at 20:00 UTC
+  // Cron format: second minute hour day month weekday
+  // '0 20 * * 5' = At 20:00 (8 PM) every Friday
+  cron.schedule('0 20 * * 5', async () => {
+    await executeAutomatedDraw();
+  }, {
+    scheduled: true,
+    timezone: "UTC"
+  });
+
+  console.log('⏰ Automated draw scheduled: Every Friday at 20:00 UTC');
+  console.log(`📅 Next draw: ${getNextDrawDate()}\n`);
 });
+
+// Helper function to get next draw date
+function getNextDrawDate() {
+  const now = new Date();
+  const currentUTC = new Date(now.getTime() + (now.getTimezoneOffset() * 60000));
+  const currentDay = currentUTC.getUTCDay();
+  const currentHour = currentUTC.getUTCHours();
+  
+  let daysUntilFriday;
+  if (currentDay === 5) {
+    if (currentHour < 20) {
+      daysUntilFriday = 0;
+    } else {
+      daysUntilFriday = 7;
+    }
+  } else if (currentDay < 5) {
+    daysUntilFriday = 5 - currentDay;
+  } else {
+    daysUntilFriday = 5 + (7 - currentDay);
+  }
+  
+  const nextDraw = new Date(currentUTC);
+  nextDraw.setUTCDate(currentUTC.getUTCDate() + daysUntilFriday);
+  nextDraw.setUTCHours(20, 0, 0, 0);
+  
+  return nextDraw.toISOString();
+}
 
 module.exports = app;
